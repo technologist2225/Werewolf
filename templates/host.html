@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bàn Quản Trò — Ma Sói</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+<div class="wrap">
+  <div class="top-bar">
+    <div>
+      <div class="eyebrow-mark">Bàn quản trò</div>
+      <h2 class="mt-0 mb-0" id="host-title">Đang tải...</h2>
+    </div>
+    <div id="phase-tag"></div>
+  </div>
+
+  <div class="panel center" id="code-panel">
+    <p class="muted mb-0" style="margin-bottom:8px;">Đọc mã này cho mọi người vào phòng</p>
+    <div class="room-code" id="room-code">----</div>
+  </div>
+
+  <div class="panel" id="lobby-panel">
+    <h3 class="mt-0">Người chơi trong phòng (<span id="player-count">0</span>)</h3>
+    <div id="player-list"></div>
+    <button class="btn-primary" id="start-btn" disabled>Cần thêm người chơi</button>
+  </div>
+
+  <div class="panel" id="night-panel" style="display:none;">
+    <h3 class="mt-0">Đêm <span id="night-day-num"></span></h3>
+    <p>Mọi người đang nhắm mắt. Các vai đặc biệt sẽ tự thao tác trên điện thoại của họ.</p>
+    <div class="night-status" id="night-status"></div>
+    <button class="btn-danger" id="resolve-btn">Tổng kết đêm — Trời sáng</button>
+  </div>
+
+  <div class="panel" id="day-panel" style="display:none;">
+    <h3 class="mt-0">Ngày <span id="day-day-num"></span> — Bỏ phiếu treo cổ</h3>
+    <p id="day-result-msg" class="muted"></p>
+    <div class="radio-list" id="vote-list"></div>
+    <button class="btn-danger" id="vote-btn" disabled>Treo cổ nghi phạm</button>
+  </div>
+
+  <div class="panel" id="end-panel" style="display:none;">
+    <h3 class="mt-0" id="end-title"></h3>
+    <table class="result-table">
+      <thead><tr><th>Người chơi</th><th>Vai trò</th><th>Kết quả</th></tr></thead>
+      <tbody id="result-body"></tbody>
+    </table>
+  </div>
+
+  <div class="panel" id="alive-panel" style="display:none;">
+    <h3 class="mt-0">Danh sách người chơi</h3>
+    <div id="alive-list"></div>
+  </div>
+
+  <div class="panel" id="log-panel" style="display:none;">
+    <h3 class="mt-0">Diễn biến</h3>
+    <div id="log-list"></div>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='js/common.js') }}"></script>
+<script src="{{ url_for('static', filename='js/host.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vai trò của bạn — Ma Sói</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+<div class="wrap" style="max-width: 560px;">
+  <div class="top-bar">
+    <div class="eyebrow-mark">Phòng <span id="room-code-label"></span></div>
+    <div id="phase-tag"></div>
+  </div>
+
+  <div class="panel center" id="waiting-panel">
+    <h3 class="mt-0">Đang chờ quản trò...</h3>
+    <p>Ổn định chỗ ngồi, tắt chuông điện thoại. Trò chơi sẽ bắt đầu khi đủ người.</p>
+  </div>
+
+  <div class="panel" id="role-panel" style="display:none;">
+    <div class="role-card">
+      <p class="muted mb-0" id="role-side">PHE</p>
+      <div class="role-name" id="role-name">???</div>
+      <p class="role-desc" id="role-desc"></p>
+    </div>
+  </div>
+
+  <div class="panel" id="status-panel" style="display:none;">
+    <p class="center mb-0" id="alive-status"></p>
+  </div>
+
+  <div class="panel" id="action-panel" style="display:none;">
+    <h3 class="mt-0" id="action-title"></h3>
+    <p id="action-desc" class="muted"></p>
+    <div class="target-list" id="target-list"></div>
+    <div id="witch-actions"></div>
+    <div id="seer-result"></div>
+  </div>
+
+  <div class="panel center" id="idle-night-panel" style="display:none;">
+    <p class="mb-0">Đêm đã buông xuống. Hãy nhắm mắt và giữ im lặng chờ trời sáng.</p>
+  </div>
+
+  <div class="panel center" id="day-panel" style="display:none;">
+    <h3 class="mt-0">Trời đã sáng</h3>
+    <p id="day-msg" class="mb-0"></p>
+  </div>
+
+  <div class="panel center" id="end-panel" style="display:none;">
+    <h3 class="mt-0" id="end-title"></h3>
+    <div class="role-name" id="end-tag"></div>
+    <p id="end-role-reveal" class="muted"></p>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='js/common.js') }}"></script>
+<script src="{{ url_for('static', filename='js/player.js') }}"></script>
+</body>
+</html>
