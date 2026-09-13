@@ -89,3 +89,32 @@ hành trực tiếp bằng lời khi các vai này cần thao tác đặc biệt
 
 Dữ liệu phòng lưu trong RAM, mất khi tắt server — phù hợp cho một buổi chơi.
 Muốn lưu nhiều bàn cùng lúc lâu dài hơn thì có thể thay bằng Redis/SQLite.
+
+## Chơi online với bạn ở xa (deploy lên hosting)
+
+Vì dữ liệu phòng (`rooms`) chỉ lưu trong RAM của **một tiến trình**, khi deploy
+bạn phải chạy **đúng 1 instance / 1 worker**. Nếu chạy nhiều worker hoặc nhiều
+instance, mỗi cái sẽ có bộ nhớ `rooms` riêng và người chơi có thể bị "vào
+phòng không tồn tại" dù người khác vừa tạo. `Procfile` đã cấu hình sẵn
+`--workers 1` cho đúng yêu cầu này.
+
+### Deploy lên Render.com (miễn phí, có link cố định dạng `https://ten-app.onrender.com`)
+
+1. Đưa code lên GitHub: tạo repo mới, `git init && git add . && git commit -m "init" && git push`.
+2. Vào [render.com](https://render.com) → đăng ký/đăng nhập bằng GitHub.
+3. **New +** → **Web Service** → chọn repo vừa đẩy lên.
+4. Điền cấu hình:
+   - **Runtime**: Python 3
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `gunicorn app:app --workers 1 --threads 8 --timeout 120`
+   - **Instance Type**: Free
+5. Bấm **Create Web Service**, đợi build xong (1-2 phút) là có link
+   `https://ten-app.onrender.com` dùng được cho mọi người ở bất kỳ đâu.
+
+Lưu ý gói Free của Render sẽ "ngủ" sau ~15 phút không có ai truy cập, và khi
+có người vào lại sẽ mất khoảng 30-60 giây khởi động lại — **đồng thời dữ liệu
+phòng cũ sẽ mất** vì server restart. Với một buổi chơi thì không sao, chỉ cần
+tạo phòng mới sau khi server tỉnh dậy. Muốn server không ngủ và bền hơn thì
+nâng cấp gói trả phí, hoặc dùng Railway/Fly.io (cấu hình tương tự, cũng cần
+`--workers 1`).
+
