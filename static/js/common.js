@@ -34,7 +34,10 @@ function showToast(message, isError) {
 function phaseTag(phase) {
   const map = {
     lobby: { text: "Phòng chờ", cls: "tag-lobby" },
+    election: { text: "Bầu Trưởng Làng", cls: "tag-day" },
+    transition: { text: "Đang chuyển cảnh", cls: "tag-night" },
     night: { text: "Ban đêm", cls: "tag-night" },
+    hunter_shoot: { text: "Thợ Săn bắn trả", cls: "tag-ended" },
     day: { text: "Ban ngày", cls: "tag-day" },
     ended: { text: "Kết thúc", cls: "tag-ended" },
   };
@@ -46,14 +49,12 @@ function getSession() {
   return {
     room: localStorage.getItem("mawoi_room") || "",
     name: localStorage.getItem("mawoi_name") || "",
-    isHost: localStorage.getItem("mawoi_is_host") === "1",
   };
 }
 
-function setSession(room, name, isHost) {
+function setSession(room, name) {
   localStorage.setItem("mawoi_room", room);
   localStorage.setItem("mawoi_name", name);
-  localStorage.setItem("mawoi_is_host", isHost ? "1" : "0");
 }
 
 const ROLE_INFO = {
@@ -61,9 +62,9 @@ const ROLE_INFO = {
   "Tiên Tri": { side: "Phe Dân", desc: "Mỗi đêm được soi một người để biết họ có phải Ma Sói hay không." },
   "Bảo Vệ": { side: "Phe Dân", desc: "Mỗi đêm che chở một người, giúp họ miễn nhiễm với vết cắn của Sói đêm đó." },
   "Phù Thủy": { side: "Phe Dân", desc: "Có một bình cứu và một bình độc, mỗi bình chỉ dùng được một lần trong cả ván." },
-  "Thợ Săn": { side: "Phe Dân", desc: "Nếu bị loại, có thể bắn theo một người khác. (Quản trò xử lý trực tiếp khi bạn bị loại)" },
-  "Thần Tình Yêu": { side: "Phe Dân", desc: "Đêm đầu tiên chọn hai người thành đôi uyên ương gắn kết số phận. (Quản trò hướng dẫn trực tiếp)" },
-  "Trưởng Làng": { side: "Phe Dân", desc: "Lá phiếu có giá trị gấp đôi khi biểu quyết ban ngày." },
+  "Thợ Săn": { side: "Phe Dân", desc: "Nếu bị loại (Sói cắn, trúng độc hoặc bị treo cổ), được bắn theo một người khác trước khi gục ngã. Web tự hiện nút bắn ngay khi điều đó xảy ra." },
+  "Thần Tình Yêu": { side: "Phe Dân", desc: "Đêm đầu tiên chọn hai người thành đôi uyên ương gắn kết số phận." },
+  "Trưởng Làng": { side: "Phe Dân", desc: "Vai đặc biệt cho bàn lớn. Lưu ý: chức Trưởng Làng thật trong ván này do cả làng tự bầu ở đầu ván, không nhất thiết là vai bài này." },
   "Thổi Sáo": { side: "Phe thứ ba", desc: "Mỗi đêm thôi miên hai người. Thắng khi tất cả người còn sống đều bị thôi miên." },
   "Ăn Trộm": { side: "Phe thứ ba", desc: "Đêm đầu tiên được đổi sang một trong hai vai dự phòng." },
   "Phản Bội": { side: "Phe thứ ba", desc: "Ban đầu là dân nhưng nếu bị Sói cắn mà không chết, sẽ ngả theo phe Sói." },
@@ -71,5 +72,129 @@ const ROLE_INFO = {
 };
 
 function roleInfo(role) {
-  return ROLE_INFO[role] || { side: "", desc: "Hãy chờ hướng dẫn của quản trò." };
+  return ROLE_INFO[role] || { side: "", desc: "Hãy chờ hướng dẫn tiếp theo." };
+}
+
+const NIGHT_STEPS = [
+  { key: "guard", label: "Bảo Vệ" },
+  { key: "wolf", label: "Ma Sói" },
+  { key: "seer", label: "Tiên Tri" },
+  { key: "witch", label: "Phù Thủy" },
+];
+
+function initials(name) {
+  const parts = name.trim().split(/\s+/);
+  const last = parts[parts.length - 1] || name;
+  return last.slice(0, 2).toUpperCase();
+}
+
+function avatarColor(name) {
+  const colors = ["#22e0ff", "#38e29b", "#ffb84d", "#ff4d5e", "#9d8cff", "#5fd0d0"];
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+  return colors[hash % colors.length];
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[ch]));
+}
+
+/**
+ * Dựng một lưới thẻ avatar để chọn mục tiêu (giống kiểu "chọn rồi khoá lựa
+ * chọn" trong ảnh tham khảo), dùng chung cho Sói / Bảo Vệ / Tiên Tri /
+ * Phù Thủy / bỏ phiếu ngày / bầu Trưởng Làng.
+ *
+ * options:
+ *   key         - QUAN TRỌNG: chuỗi định danh trạng thái hiện tại (vd
+ *                 "day:3:false"). Nếu key không đổi so với lần dựng trước,
+ *                 hàm sẽ KHÔNG dựng lại DOM — tránh việc cứ vài giây poll
+ *                 lại xoá mất lựa chọn người dùng đang chọn dở (bug không
+ *                 bấm chọn được vì bị reset liên tục). Đổi key khi thật sự
+ *                 cần dựng lại (đổi lượt, đổi ngày, đã bỏ phiếu xong...).
+ *   container   - phần tử DOM sẽ chứa lưới + nút khoá
+ *   names       - danh sách tên hiển thị làm thẻ chọn
+ *   selfName    - tên của người đang xem (gắn nhãn "(bạn)")
+ *   allowAbstain- có thêm thẻ "bỏ qua/không bầu/bỏ phiếu trắng" hay không
+ *   abstainLabel- nhãn cho thẻ bỏ qua đó
+ *   confirmLabel- chữ trên nút khoá lựa chọn
+ *   danger      - tô viền đỏ khi chọn (dùng cho hành động của Sói/đầu độc)
+ *   onConfirm   - callback(selectedNameOrEmptyString) khi bấm nút khoá
+ */
+function renderSelectionGrid(container, {
+  key, names, selfName = null, allowAbstain = false, abstainLabel = "Bỏ qua",
+  confirmLabel = "Khoá lựa chọn", danger = false, onConfirm,
+}) {
+  if (key && container.dataset.gridKey === key) {
+    return; // trạng thái không đổi — giữ nguyên DOM để không mất lựa chọn đang chọn dở
+  }
+  if (key) container.dataset.gridKey = key;
+
+  let selected = null;
+
+  const cardHtml = (name, isAbstain) => `
+    <div class="avatar-card ${isAbstain ? "abstain-card" : ""}" data-name="${escapeHtml(name)}">
+      <div class="avatar-card-ring">
+        ${isAbstain
+          ? `<span class="avatar avatar-abstain">–</span>`
+          : `<span class="avatar" style="background:${avatarColor(name)}">${initials(name)}</span>`}
+      </div>
+      <div class="avatar-card-name">${escapeHtml(name)}${name === selfName ? " (bạn)" : ""}</div>
+    </div>
+  `;
+
+  const cards = names.map(n => cardHtml(n, false)).join("") + (allowAbstain ? cardHtml(abstainLabel, true) : "");
+
+  container.innerHTML = `
+    <div class="avatar-grid ${danger ? "danger" : ""}">${cards}</div>
+    <button class="btn-lockin ${danger ? "danger" : ""}" id="grid-lockin-btn" disabled>${confirmLabel}</button>
+  `;
+
+  const abstainName = allowAbstain ? abstainLabel : null;
+
+  container.querySelectorAll(".avatar-card").forEach(card => {
+    card.addEventListener("click", () => {
+      container.querySelectorAll(".avatar-card").forEach(c => c.classList.remove("selected"));
+      card.classList.add("selected");
+      const rawName = card.dataset.name;
+      selected = (allowAbstain && rawName === abstainName) ? "" : rawName;
+      document.getElementById("grid-lockin-btn").disabled = false;
+    });
+  });
+
+  document.getElementById("grid-lockin-btn").addEventListener("click", () => {
+    if (selected === null) return;
+    onConfirm(selected);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Giao diện thẻ vai trò (màn hình chơi)
+// Muốn dùng tranh minh hoạ riêng: đặt ảnh vào static/img/roles/<slug>.png
+// (vd ma-soi.png) — ảnh sẽ tự phủ lên biểu tượng emoji, không cần sửa code.
+// ---------------------------------------------------------------------------
+const ROLE_STYLE = {
+  "Dân Làng":       { slug: "dan-lang",      icon: "🧑‍🌾", color: "#c59a56", glow: "rgba(197,154,86,.55)" },
+  "Ma Sói":         { slug: "ma-soi",        icon: "🐺",   color: "#d23a45", glow: "rgba(210,58,69,.65)" },
+  "Tiên Tri":       { slug: "tien-tri",      icon: "🔮",   color: "#6aa7ff", glow: "rgba(106,167,255,.55)" },
+  "Bảo Vệ":         { slug: "bao-ve",        icon: "🛡️",   color: "#4fbf86", glow: "rgba(79,191,134,.55)" },
+  "Phù Thủy":       { slug: "phu-thuy",      icon: "🧙‍♀️", color: "#a45be0", glow: "rgba(164,91,224,.6)" },
+  "Thợ Săn":        { slug: "tho-san",       icon: "🏹",   color: "#d98a30", glow: "rgba(217,138,48,.55)" },
+  "Thần Tình Yêu":  { slug: "than-tinh-yeu", icon: "💘",   color: "#e0568f", glow: "rgba(224,86,143,.55)" },
+  "Trưởng Làng":    { slug: "truong-lang",   icon: "👑",   color: "#e5c15a", glow: "rgba(229,193,90,.55)" },
+  "Thổi Sáo":       { slug: "thoi-sao",      icon: "🪈",   color: "#3fb2d6", glow: "rgba(63,178,214,.55)" },
+  "Ăn Trộm":        { slug: "an-trom",       icon: "🦝",   color: "#8c93a3", glow: "rgba(140,147,163,.5)" },
+  "Phản Bội":       { slug: "phan-boi",      icon: "🎭",   color: "#b05050", glow: "rgba(176,80,80,.55)" },
+};
+function roleStyle(role) {
+  return ROLE_STYLE[role] || { slug: "", icon: "❔", color: "#7f9aa1", glow: "rgba(127,154,161,.4)" };
+}
+
+const MOON_SVG = `<svg viewBox="0 0 48 48"><defs><radialGradient id="mg" cx="40%" cy="35%"><stop offset="0" stop-color="#fff6cf"/><stop offset="1" stop-color="#e8b84a"/></radialGradient></defs><path d="M31 6a18 18 0 1 0 11 30A15 15 0 0 1 31 6z" fill="url(#mg)"/><circle cx="14" cy="14" r="1.4" fill="#fff6cf"/><circle cx="40" cy="12" r="1" fill="#fff6cf"/></svg>`;
+const SUN_SVG = `<svg viewBox="0 0 48 48"><defs><radialGradient id="sg" cx="45%" cy="40%"><stop offset="0" stop-color="#fff6cf"/><stop offset="1" stop-color="#f0a52e"/></radialGradient></defs><g stroke="#f6c85f" stroke-width="2.4" stroke-linecap="round"><path d="M24 3v6M24 39v6M3 24h6M39 24h6M9 9l4 4M35 35l4 4M39 9l-4 4M13 35l-4 4"/></g><circle cx="24" cy="24" r="10" fill="url(#sg)"/></svg>`;
+
+function fmtTime(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
 }

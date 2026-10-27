@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Web Quản Trò Ma Sói
---------------------
-Backend Flask phục vụ toàn bộ luồng chơi: tạo phòng, vào phòng, chia vai,
-hành động ban đêm (Sói / Tiên Tri / Bảo Vệ / Phù Thủy), tổng kết đêm,
-bỏ phiếu treo cổ ban ngày và kiểm tra điều kiện thắng thua.
+Web Quản Trò Ma Sói — bản KHÔNG CẦN quản trò con người.
+--------------------------------------------------------
+Web tự đóng vai quản trò: bầu Trưởng Làng trước đêm đầu tiên, lần lượt gọi
+từng vai đặc biệt dậy vào ban đêm theo đúng thứ tự cổ điển
+(Bảo Vệ → Sói → Tiên Tri → Phù Thủy), có khoảng lặng giữa các bước như MC
+thật, tự công bố kết quả (nạn nhân / người bị treo cổ) rồi mới chuyển cảnh
+tiếp theo, và tự kiểm tra thắng thua.
 
-Dữ liệu được lưu trong RAM (dict `rooms`). Phù hợp để chạy 1 bàn chơi
-offline, mất dữ liệu khi restart server (đúng như thiết kế ban đầu).
+Dữ liệu lưu trong RAM (dict `rooms`), một tiến trình duy nhất (xem README).
 """
 
 import random
@@ -19,37 +20,60 @@ from flask import Flask, request, jsonify, render_template
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Dữ liệu trong RAM
+# Hằng số thời gian (giây)
 # ---------------------------------------------------------------------------
+MIN_PLAYERS = 5
+ELECTION_SECONDS = 45          # thời gian bầu Trưởng Làng
+NIGHT_SUBPHASE_SECONDS = 30    # mỗi vai có tối đa 30s để hành động
+DAY_VOTE_SECONDS = 120         # cả làng có 2 phút để bỏ phiếu ban ngày (tự kết thúc sớm nếu ai cũng đã bỏ phiếu)
+NIGHT_PAUSE_SECONDS = 3        # khoảng lặng trước khi gọi vai tiếp theo dậy
+REVEAL_SECONDS = 5             # thời gian hiện kết quả (nạn nhân / người bị treo cổ) trước khi sang cảnh kế
+SEER_RESULT_READ_SECONDS = 20  # thời gian riêng để Tiên Tri đọc kết quả soi trước khi tự bấm "Tiếp tục"
+HUNTER_SHOOT_SECONDS = 20      # thời gian Thợ Săn chọn người bắn theo sau khi bị loại
+ROOM_IDLE_TIMEOUT = 6 * 3600   # phòng không hoạt động quá 6 tiếng sẽ tự bị dọn khỏi bộ nhớ
+
+WOLF_ROLES = {"Ma Sói"}
+HUNTER_ROLE = "Thợ Săn"
+
+# Thứ tự hiển thị các thẻ vai trò đang có trong ván
+ROLE_ORDER = ["Dân Làng", "Ma Sói", "Tiên Tri", "Bảo Vệ", "Phù Thủy", "Thợ Săn",
+              "Thần Tình Yêu", "Trưởng Làng", "Thổi Sáo", "Ăn Trộm", "Phản Bội"]
+
+CHAT_MAX_LEN = 200
+CHAT_KEEP = 200
+CHAT_COOLDOWN = 0.4   # giây giữa hai tin nhắn của cùng một người (chống spam)
+
+NIGHT_ORDER = ["guard", "wolf", "seer", "witch"]
+SUBPHASE_ROLE = {
+    "guard": "Bảo Vệ",
+    "wolf": "Ma Sói",
+    "seer": "Tiên Tri",
+    "witch": "Phù Thủy",
+}
+SUBPHASE_LABEL = {
+    "guard": "Bảo Vệ đang che chở",
+    "wolf": "Ma Sói đang chọn con mồi",
+    "seer": "Tiên Tri đang soi",
+    "witch": "Phù Thủy đang cân nhắc dùng thuốc",
+}
+
 rooms = {}  # room_code -> GameRoom
 
-MIN_PLAYERS = 5
 
-# Vai trò thuộc phe Sói (dùng để tính thắng/thua)
-WOLF_ROLES = {"Ma Sói"}
-
-
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 class Player:
-    def __init__(self, name, is_host=False):
+    def __init__(self, name):
         self.name = name
         self.role = None
         self.is_alive = True
-        self.is_host = is_host
-        # Trạng thái dùng thuốc của Phù Thủy
         self.witch_used_save = False
         self.witch_used_kill = False
+        self.used_shot = False  # Thợ Săn đã dùng phát bắn trả hay chưa
 
     def to_public_dict(self):
-        return {
-            "name": self.name,
-            "is_alive": self.is_alive,
-            "is_host": self.is_host,
-        }
-
-    def to_full_dict(self):
-        d = self.to_public_dict()
-        d["role"] = self.role
-        return d
+        return {"name": self.name, "is_alive": self.is_alive}
 
 
 class GameRoom:
@@ -57,18 +81,55 @@ class GameRoom:
         self.room_code = room_code
         self.players = []
         self.is_started = False
-        self.phase = "lobby"  # lobby -> night -> day -> ended
+        self.phase = "lobby"          # lobby -> election -> (transition<->night) -> (transition<->day) -> ... -> ended
         self.day_count = 0
-        self.winner = None  # None | "soi" | "dan"
+        self.winner = None            # None | "soi" | "dan"
+        self.created_at = time.time()
+        self.last_activity = time.time()
 
-        # Hành động ban đêm (reset sau mỗi lần tổng kết đêm)
+        # Trưởng Làng
+        self.chief_name = None
+        self.election_done = False    # bầu 1 lần duy nhất, ngay sau khi qua đêm đầu tiên
+        self.election_votes = {}      # voter_name -> choice_name ("" = không bầu ai)
+        self.election_deadline = None
+        self.last_election_result = None
+
+        # Đêm
+        self.night_sequence = []      # vd ["wolf", "seer", "witch"]
+        self._night_index = 0
+        self.subphase = None
+        self.subphase_deadline = None
         self.wolf_target = None
         self.guard_target = None
         self.witch_save_target = None
         self.witch_kill_target = None
-
+        self.wolf_ready = set()       # đồng bộ nhiều Sói (bàn 8+ người)
         self.last_night_result = None
+
+        # Ngày
+        self.day_deadline = None
+        self.votes = {}               # voter_name -> suspect_name ("" = bỏ phiếu trắng)
+        self.last_day_result = None
+
+        # Khoảng lặng / công bố kết quả dùng chung
+        self.transition_deadline = None
+        self.transition_message = None
+        self.transition_kind = None   # "pause" | "reveal"
+        self.transition_context = {}  # dữ liệu có cấu trúc để vẽ giao diện (avatar nạn nhân...)
+        self.pending_action = None
+
+        # Thợ Săn — bắn trả một người khi bị loại
+        self.hunter_pending_name = None
+        self.hunter_deadline = None
+        self.hunter_chain_cont = None     # "continue_night" | "continue_day"
+        self.hunter_last_shot = None
+
         self.log = []
+
+        # Chat: 3 kênh — "general" (cả làng, ban ngày), "wolf" (Sói, ban đêm), "dead" (người đã chết)
+        self.chat = []
+        self._chat_seq = 0
+        self._chat_last = {}
 
     # ------------------------------------------------------------------
     def find_player(self, name):
@@ -79,13 +140,11 @@ class GameRoom:
 
     def add_log(self, message):
         self.log.append({"time": time.time(), "message": message})
-        # Giữ log gọn
         self.log = self.log[-100:]
+        self.last_activity = time.time()
 
     # ------------------------------------------------------------------
     def assign_roles(self):
-        """Chia vai theo số lượng người chơi, dựa theo bảng thiết lập của
-        quản trò (xem tài liệu thiết kế)."""
         n = len(self.players)
         random.shuffle(self.players)
 
@@ -93,10 +152,8 @@ class GameRoom:
             raise ValueError("Cần ít nhất 5 người chơi để bắt đầu!")
 
         if n <= 6:
-            # 5-6 người: 1 Sói, 1 Tiên Tri, 1 Phù Thủy, còn lại Dân Làng
             roles = ["Ma Sói", "Tiên Tri", "Phù Thủy"] + ["Dân Làng"] * (n - 3)
         elif n == 7:
-            # Không có trong bảng gốc -> nội suy hợp lý
             roles = ["Ma Sói", "Tiên Tri", "Bảo Vệ", "Phù Thủy"] + ["Dân Làng"] * (n - 4)
         elif 8 <= n <= 9:
             roles = ["Ma Sói", "Ma Sói", "Tiên Tri", "Bảo Vệ"] + ["Dân Làng"] * (n - 4)
@@ -107,8 +164,7 @@ class GameRoom:
         elif n == 14:
             roles = (
                 ["Ma Sói", "Ma Sói", "Ma Sói", "Tiên Tri", "Bảo Vệ", "Thợ Săn", "Thần Tình Yêu", "Phù Thủy"]
-                + ["Dân Làng"] * 5
-                + ["Phản Bội"]
+                + ["Dân Làng"] * 5 + ["Phản Bội"]
             )
         elif n == 15:
             roles = (
@@ -131,7 +187,6 @@ class GameRoom:
                 + ["Dân Làng"] * 6
             )
         else:
-            # Trên 18 người: mở rộng tỉ lệ Sói ~ 1/4 tổng số người
             special = ["Ma Sói", "Ma Sói", "Ma Sói", "Ma Sói", "Tiên Tri", "Bảo Vệ", "Thợ Săn", "Thần Tình Yêu", "Phù Thủy", "Trưởng Làng", "Thổi Sáo", "Ăn Trộm"]
             extra_wolves = max(0, (n // 4) - 4)
             roles = special + ["Ma Sói"] * extra_wolves
@@ -141,35 +196,438 @@ class GameRoom:
             player.role = role
             player.witch_used_save = False
             player.witch_used_kill = False
+            player.used_shot = False
 
         self.is_started = True
-        self.phase = "night"
         self.day_count = 1
-        self.add_log("Trò chơi bắt đầu, vai trò đã được chia xong.")
+        self.add_log("Trò chơi bắt đầu — vai trò đã được chia bí mật cho từng người.")
+        self.start_night()
 
     # ------------------------------------------------------------------
-    def reset_night_actions(self):
+    # Khoảng lặng / công bố kết quả (dùng chung cho mọi lần chuyển cảnh)
+    # ------------------------------------------------------------------
+    def enter_transition(self, seconds, message, pending_action, kind="pause", context=None):
+        self.phase = "transition"
+        self.transition_deadline = time.time() + seconds
+        self.transition_message = message
+        self.transition_kind = kind
+        self.transition_context = context or {}
+        self.pending_action = pending_action
+
+    def _resolve_transition(self):
+        action, self.pending_action = self.pending_action, None
+        self.transition_message = None
+        self.transition_deadline = None
+        if action == "start_night_subphase":
+            self._activate_current_subphase()
+        elif action == "after_election_reveal":
+            self._open_day_actual()
+        elif action == "after_night_reveal":
+            victims = self.last_night_result["victims"] if self.last_night_result else []
+            if not self._maybe_trigger_hunter(victims, "continue_night"):
+                self._after_night_reveal()
+        elif action == "after_day_reveal":
+            hanged = self.last_day_result["hanged"] if self.last_day_result else None
+            if not self._maybe_trigger_hunter([hanged] if hanged else [], "continue_day"):
+                self._open_next_round_or_end()
+        elif action == "start_hunter_shoot":
+            self.phase = "hunter_shoot"
+            self.hunter_deadline = time.time() + HUNTER_SHOOT_SECONDS
+        elif action == "after_hunter_reveal":
+            self._after_hunter_reveal_actual()
+
+    # ------------------------------------------------------------------
+    # Bầu Trưởng Làng — diễn ra đúng MỘT LẦN, ngay sau khi qua đêm đầu tiên,
+    # trước khi mở phiên bỏ phiếu ban ngày đầu tiên.
+    # ------------------------------------------------------------------
+    def _start_election_actual(self):
+        self.phase = "election"
+        self.election_votes = {}
+        self.election_deadline = time.time() + ELECTION_SECONDS
+        self.add_log("Cả làng bắt đầu bầu Trưởng Làng.")
+
+    def cast_election_vote(self, voter_name, choice_name):
+        self.election_votes[voter_name] = choice_name or ""
+        if len(self.election_votes) >= len(self.alive_players()):
+            self.resolve_election()
+
+    def resolve_election(self):
+        # Mỗi người còn sống là một ứng viên hợp lệ, khởi điểm 0 phiếu —
+        # nhờ vậy nếu không ai bỏ phiếu (hoặc toàn bỏ phiếu trắng) thì mọi
+        # người đều đang "bằng phiếu cao nhất" và vẫn bốc ngẫu nhiên được.
+        tally = {p.name: 0 for p in self.alive_players()}
+        for choice in self.election_votes.values():
+            if choice and choice in tally:
+                tally[choice] += 1
+
+        chief = None
+        if tally:
+            top_votes = max(tally.values())
+            top = [name for name, c in tally.items() if c == top_votes]
+            # Hòa phiếu (hoặc không ai bầu ai) -> random 1 người trong nhóm cao phiếu nhất
+            chief = random.choice(top)
+
+        self.chief_name = chief
+        if chief:
+            msg = f"{chief} được chọn làm Trưởng Làng! Phiếu của Trưởng Làng sẽ tính gấp đôi khi biểu quyết ban ngày."
+        else:
+            msg = "Không có ai còn sống để làm Trưởng Làng."
+        self.add_log(msg)
+        self.last_election_result = {"chief": chief, "message": msg}
+        self.election_votes = {}
+        self.election_deadline = None
+        self.enter_transition(
+            REVEAL_SECONDS, msg, "after_election_reveal", kind="reveal",
+            context={"type": "election_result", "chief": chief},
+        )
+
+    # ------------------------------------------------------------------
+    # Thợ Săn — bị loại (Sói cắn / độc / treo cổ) thì được bắn trả 1 người
+    # ------------------------------------------------------------------
+    def _maybe_trigger_hunter(self, dead_names, cont):
+        for name in dead_names:
+            p = self.find_player(name)
+            if p and p.role == HUNTER_ROLE and not p.used_shot:
+                self.hunter_pending_name = name
+                self.hunter_chain_cont = cont
+                self.add_log(f"{name} là Thợ Săn! Chuẩn bị bắn trả trước khi gục ngã...")
+                self.enter_transition(
+                    NIGHT_PAUSE_SECONDS, f"{name} là Thợ Săn — chuẩn bị bắn trả...",
+                    "start_hunter_shoot", kind="pause",
+                    context={"type": "hunter_pause", "hunter": name},
+                )
+                return True
+        return False
+
+    def resolve_hunter_shoot(self, target_name):
+        hunter_name = self.hunter_pending_name
+        hunter = self.find_player(hunter_name)
+        if hunter:
+            hunter.used_shot = True
+
+        shot_name = None
+        if target_name:
+            target = self.find_player(target_name)
+            if target and target.is_alive and target.name != hunter_name:
+                target.is_alive = False
+                shot_name = target_name
+                msg = f"{hunter_name} (Thợ Săn) đã bắn theo {target_name} trước khi gục ngã!"
+            else:
+                msg = f"{hunter_name} (Thợ Săn) không bắn ai (mục tiêu không hợp lệ)."
+        else:
+            msg = f"{hunter_name} (Thợ Săn) quyết định không bắn ai."
+
+        self.add_log(msg)
+        self.hunter_last_shot = shot_name
+        self.hunter_pending_name = None
+        self.hunter_deadline = None
+        self.enter_transition(
+            REVEAL_SECONDS, msg, "after_hunter_reveal", kind="reveal",
+            context={"type": "hunter_result", "victim": shot_name},
+        )
+
+    def _after_hunter_reveal_actual(self):
+        if self.check_win():
+            return
+        shot = self.hunter_last_shot
+        cont = self.hunter_chain_cont
+        self.hunter_last_shot = None
+        # Bắn dây chuyền: người vừa bị bắn cũng là Thợ Săn chưa bắn -> thêm một lượt nữa
+        if shot and self._maybe_trigger_hunter([shot], cont):
+            return
+        if cont == "continue_night":
+            self._after_night_reveal()
+        elif cont == "continue_day":
+            self._open_next_round_or_end()
+
+    # ------------------------------------------------------------------
+    # Ban đêm
+    # ------------------------------------------------------------------
+    def build_night_sequence(self):
+        return [s for s in NIGHT_ORDER if any(p.role == SUBPHASE_ROLE[s] and p.is_alive for p in self.players)]
+
+    def start_night(self):
         self.wolf_target = None
         self.guard_target = None
         self.witch_save_target = None
         self.witch_kill_target = None
+        self.wolf_ready = set()   # tên các Sói đã xác nhận lựa chọn đêm nay (đồng bộ nhiều Sói)
+        self.night_sequence = self.build_night_sequence()
+        self._night_index = 0
+        if self.night_sequence:
+            self._queue_subphase_transition()
+        else:
+            self._finish_night_actual()
+
+    def _queue_subphase_transition(self):
+        role_key = self.night_sequence[self._night_index]
+        self.subphase = role_key
+        self.add_log(f"{SUBPHASE_LABEL[role_key]}...")
+        self.enter_transition(
+            NIGHT_PAUSE_SECONDS,
+            f"Tiếp theo: {SUBPHASE_ROLE[role_key]}",
+            "start_night_subphase",
+            kind="pause",
+            context={"type": "night_pause", "role": SUBPHASE_ROLE[role_key]},
+        )
+
+    def _activate_current_subphase(self):
+        self.phase = "night"
+        self.subphase_deadline = time.time() + NIGHT_SUBPHASE_SECONDS
+
+    def advance_subphase(self):
+        """Gọi sau khi vai hiện tại hành động xong (hoặc bỏ qua)."""
+        self._night_index += 1
+        if self._night_index < len(self.night_sequence):
+            self._queue_subphase_transition()
+        else:
+            self._finish_night_actual()
+
+    def _finish_night_actual(self):
+        victims = []
+        wolf_victim = self.wolf_target
+        saved = wolf_victim is not None and (
+            wolf_victim == self.guard_target or wolf_victim == self.witch_save_target
+        )
+        if wolf_victim and not saved:
+            victims.append(wolf_victim)
+
+        if self.witch_kill_target and self.witch_kill_target not in victims:
+            victims.append(self.witch_kill_target)
+
+        for name in victims:
+            p = self.find_player(name)
+            if p:
+                p.is_alive = False
+
+        if victims:
+            msg = "Trời sáng! Nạn nhân đêm qua là: " + ", ".join(victims)
+        else:
+            msg = "Trời sáng! Đêm qua không có ai chết."
+        self.add_log(msg)
+        self.last_night_result = {"day": self.day_count, "victims": victims, "message": msg}
+
+        self.subphase = None
+        self.subphase_deadline = None
+        self.enter_transition(
+            REVEAL_SECONDS, msg, "after_night_reveal", kind="reveal",
+            context={"type": "night_result", "victims": victims},
+        )
+
+    def _after_night_reveal(self):
+        if self.check_win():
+            return
+        if not self.election_done:
+            self.election_done = True
+            self._start_election_actual()
+        else:
+            self._open_day_actual()
+
+    def _open_day_actual(self):
+        self.phase = "day"
+        self.votes = {}
+        self.last_day_result = None
+        self.day_deadline = time.time() + DAY_VOTE_SECONDS
+        self.add_log(f"Ngày {self.day_count} bắt đầu, mời cả làng bỏ phiếu.")
+
+    # ------------------------------------------------------------------
+    # Ban ngày
+    # ------------------------------------------------------------------
+    def cast_vote(self, voter_name, suspect_name):
+        self.votes[voter_name] = suspect_name or ""
+        if len(self.votes) >= len(self.alive_players()):
+            self._finish_day_actual()
+
+    def _vote_weight(self, voter_name):
+        if voter_name == self.chief_name:
+            voter = self.find_player(voter_name)
+            if voter and voter.is_alive:
+                return 2
+        return 1
+
+    def _finish_day_actual(self):
+        tally = {}
+        for voter, suspect in self.votes.items():
+            if not suspect:
+                continue
+            tally[suspect] = tally.get(suspect, 0) + self._vote_weight(voter)
+
+        hanged = None
+        if tally:
+            top_votes = max(tally.values())
+            top = [name for name, c in tally.items() if c == top_votes]
+            if len(top) == 1:
+                hanged = top[0]
+
+        if hanged:
+            p = self.find_player(hanged)
+            if p:
+                p.is_alive = False
+            msg = f"Cả làng đã bỏ phiếu treo cổ {hanged}!"
+        else:
+            msg = "Làng không đạt được đa số thống nhất — không ai bị treo cổ hôm nay."
+
+        self.add_log(msg)
+        self.last_day_result = {"day": self.day_count, "hanged": hanged, "message": msg}
+        self.votes = {}
+        self.day_deadline = None
+        self.enter_transition(
+            REVEAL_SECONDS, msg, "after_day_reveal", kind="reveal",
+            context={"type": "day_result", "hanged": hanged},
+        )
+
+    def _open_next_round_or_end(self):
+        if self.check_win():
+            return
+        self.day_count += 1
+        self.start_night()
+
+    # ------------------------------------------------------------------
+    # Chat
+    # ------------------------------------------------------------------
+    def is_night_time(self):
+        return self.phase == "night" or (
+            self.phase == "transition" and (self.transition_context or {}).get("type") == "night_pause"
+        )
+
+    def chat_channel_for(self, player):
+        """Kênh mà người này đang được phép gửi tin (None = không được chat lúc này).
+        Do server quyết định, không tin client — để không ai nói chuyện sai kênh."""
+        if not self.is_started:
+            return None
+        if self.phase == "ended":
+            return "general"
+        if not player.is_alive:
+            return "dead"
+        if self.is_night_time():
+            return "wolf" if player.role in WOLF_ROLES else None
+        return "general"
+
+    def add_chat(self, player, text):
+        channel = self.chat_channel_for(player)
+        if channel is None:
+            return None
+        self._chat_seq += 1
+        msg = {"id": self._chat_seq, "time": time.time(), "channel": channel,
+               "author": player.name, "text": text}
+        self.chat.append(msg)
+        self.chat = self.chat[-CHAT_KEEP:]
+        self.last_activity = time.time()
+        return msg
+
+    def visible_chat(self, player, limit=80):
+        out = []
+        for m in self.chat:
+            ch = m["channel"]
+            if ch == "general" or (ch == "wolf" and player.role in WOLF_ROLES) or (ch == "dead" and not player.is_alive):
+                out.append(m)
+        return out[-limit:]
+
+    # ------------------------------------------------------------------
+    # Chơi lại — giữ mã phòng + danh sách người chơi, quay về sảnh chờ
+    # ------------------------------------------------------------------
+    def reset_for_new_round(self):
+        for p in self.players:
+            p.role = None
+            p.is_alive = True
+            p.witch_used_save = False
+            p.witch_used_kill = False
+            p.used_shot = False
+
+        self.is_started = False
+        self.phase = "lobby"
+        self.day_count = 0
+        self.winner = None
+
+        self.chief_name = None
+        self.election_done = False
+        self.election_votes = {}
+        self.election_deadline = None
+        self.last_election_result = None
+
+        self.night_sequence = []
+        self._night_index = 0
+        self.subphase = None
+        self.subphase_deadline = None
+        self.wolf_target = None
+        self.guard_target = None
+        self.witch_save_target = None
+        self.witch_kill_target = None
+        self.wolf_ready = set()
+        self.last_night_result = None
+
+        self.day_deadline = None
+        self.votes = {}
+        self.last_day_result = None
+
+        self.transition_deadline = None
+        self.transition_message = None
+        self.transition_kind = None
+        self.transition_context = {}
+        self.pending_action = None
+
+        self.hunter_pending_name = None
+        self.hunter_deadline = None
+        self.hunter_chain_cont = None
+        self.hunter_last_shot = None
+
+        self.chat = []
+        self._chat_last = {}
+
+        self.add_log("Ván mới sắp bắt đầu — tất cả quay lại phòng chờ.")
+
+    # ------------------------------------------------------------------
+    def tick(self):
+        """Gọi ở đầu mỗi request để tự động chuyển cảnh khi hết giờ."""
+        if not self.is_started or self.winner:
+            return
+        now = time.time()
+        if self.phase == "transition" and self.transition_deadline and now >= self.transition_deadline:
+            self._resolve_transition()
+        elif self.phase == "election" and self.election_deadline and now >= self.election_deadline:
+            self.resolve_election()
+        elif self.phase == "night" and self.subphase_deadline and now >= self.subphase_deadline:
+            self.add_log(f"Hết giờ chờ {SUBPHASE_ROLE.get(self.subphase, '')} — tự động chuyển tiếp.")
+            self.advance_subphase()
+        elif self.phase == "day" and self.day_deadline and now >= self.day_deadline:
+            self._finish_day_actual()
+        elif self.phase == "hunter_shoot" and self.hunter_deadline and now >= self.hunter_deadline:
+            self.resolve_hunter_shoot(None)
 
     def check_win(self):
-        """Trả về 'soi' | 'dan' | None"""
         alive = self.alive_players()
         wolves_alive = [p for p in alive if p.role in WOLF_ROLES]
         others_alive = [p for p in alive if p.role not in WOLF_ROLES]
 
-        if len(wolves_alive) == 0 and self.is_started:
+        if len(wolves_alive) == 0:
             self.winner = "dan"
-        elif self.is_started and len(wolves_alive) > 0 and len(wolves_alive) >= len(others_alive):
+        elif len(wolves_alive) >= len(others_alive):
             self.winner = "soi"
         else:
             self.winner = None
 
         if self.winner:
             self.phase = "ended"
+            self.add_log("Phe Dân Làng đã chiến thắng! 🎉" if self.winner == "dan" else "Phe Ma Sói đã chiến thắng! 🐺")
         return self.winner
+
+    # ------------------------------------------------------------------
+    def seconds_left(self):
+        if self.phase == "transition":
+            deadline = self.transition_deadline
+        elif self.phase == "election":
+            deadline = self.election_deadline
+        elif self.phase == "night":
+            deadline = self.subphase_deadline
+        elif self.phase == "day":
+            deadline = self.day_deadline
+        elif self.phase == "hunter_shoot":
+            deadline = self.hunter_deadline
+        else:
+            deadline = None
+        if not deadline:
+            return None
+        return max(0, round(deadline - time.time()))
 
     def to_state_dict(self):
         return {
@@ -180,8 +638,32 @@ class GameRoom:
             "winner": self.winner,
             "players": [p.to_public_dict() for p in self.players],
             "log": self.log[-15:],
-            "last_result_msg": self.last_night_result["message"] if self.last_night_result else None,
+            "subphase": self.subphase,
+            "subphase_label": SUBPHASE_LABEL.get(self.subphase) if self.subphase else None,
+            "night_sequence": self.night_sequence,
+            "seconds_left": self.seconds_left(),
+            "votes_count": len(self.votes) if self.phase == "day" else None,
+            "election_votes_count": len(self.election_votes) if self.phase == "election" else None,
+            "alive_count": len(self.alive_players()),
+            "last_night_msg": self.last_night_result["message"] if self.last_night_result else None,
+            "last_day_msg": self.last_day_result["message"] if self.last_day_result else None,
+            "chief_name": self.chief_name,
+            "transition_message": self.transition_message,
+            "transition_kind": self.transition_kind,
+            "transition_context": self.transition_context,
+            "hunter_pending_name": self.hunter_pending_name,
+            "roles_in_play": self._roles_in_play(),
         }
+
+    def _roles_in_play(self):
+        if not self.is_started:
+            return []
+        counts = {}
+        for p in self.players:
+            if p.role:
+                counts[p.role] = counts.get(p.role, 0) + 1
+        ordered = [r for r in ROLE_ORDER if r in counts] + [r for r in counts if r not in ROLE_ORDER]
+        return [{"role": r, "count": counts[r]} for r in ordered]
 
 
 # ---------------------------------------------------------------------------
@@ -191,104 +673,130 @@ def error(message, code=400):
     return jsonify({"success": False, "message": message}), code
 
 
+def cleanup_stale_rooms():
+    """Dọn phòng bỏ hoang quá lâu để tránh rò rỉ bộ nhớ (chạy lazy khi tạo phòng mới)."""
+    now = time.time()
+    for code in [c for c, r in rooms.items() if now - r.last_activity > ROOM_IDLE_TIMEOUT]:
+        del rooms[code]
+
+
 def generate_room_code():
+    cleanup_stale_rooms()
     code = "".join(random.choices(string.digits, k=4))
     while code in rooms:
         code = "".join(random.choices(string.digits, k=4))
     return code
 
 
-def get_room_or_404(room_code):
-    return rooms.get(room_code)
+def get_room(room_code):
+    room = rooms.get(room_code)
+    if room:
+        room.last_activity = time.time()
+        room.tick()
+    return room
 
 
 # ---------------------------------------------------------------------------
-# Trang web (frontend)
+# Trang web
 # ---------------------------------------------------------------------------
 @app.route("/")
 def index():
     return render_template("index.html")
 
 
-@app.route("/host")
-def host_page():
-    return render_template("host.html")
+@app.route("/room")
+def room_page():
+    return render_template("room.html")
 
 
-@app.route("/player")
-def player_page():
-    return render_template("player.html")
+@app.route("/game")
+def game_page():
+    return render_template("game.html")
 
 
 # ---------------------------------------------------------------------------
-# API 1: Tạo phòng mới
+# API: Tạo phòng / Vào phòng — không có khái niệm "quản trò"
 # ---------------------------------------------------------------------------
 @app.route("/api/create-room", methods=["POST"])
 def create_room():
     data = request.get_json(silent=True) or {}
-    host_name = (data.get("name") or "").strip()
-    if not host_name:
+    name = (data.get("name") or "").strip()
+    if not name:
         return error("Vui lòng nhập tên của bạn!")
 
     room_code = generate_room_code()
     room = GameRoom(room_code)
-    room.players.append(Player(host_name, is_host=True))
+    room.players.append(Player(name))
+    room.add_log(f"{name} đã tạo phòng.")
     rooms[room_code] = room
 
-    return jsonify({
-        "success": True,
-        "room_code": room_code,
-        "message": "Tạo phòng thành công!",
-    })
+    return jsonify({"success": True, "room_code": room_code, "message": "Tạo phòng thành công!"})
 
 
-# ---------------------------------------------------------------------------
-# API 2: Tham gia phòng bằng mã code
-# ---------------------------------------------------------------------------
 @app.route("/api/join-room", methods=["POST"])
 def join_room():
     data = request.get_json(silent=True) or {}
     room_code = (data.get("room_code") or "").strip()
-    player_name = (data.get("name") or "").strip()
-
-    if not room_code or not player_name:
+    name = (data.get("name") or "").strip()
+    if not room_code or not name:
         return error("Vui lòng nhập đầy đủ mã phòng và tên!")
 
-    room = get_room_or_404(room_code)
+    room = get_room(room_code)
     if not room:
         return error("Phòng không tồn tại!", 404)
-
     if room.is_started:
         return error("Trò chơi đã bắt đầu, không thể vào phòng!")
-
-    if room.find_player(player_name):
+    if room.find_player(name):
         return error("Tên này đã có người dùng trong phòng, hãy chọn tên khác!")
 
-    room.players.append(Player(player_name))
-    room.add_log(f"{player_name} đã vào phòng.")
+    room.players.append(Player(name))
+    room.add_log(f"{name} đã vào phòng.")
 
-    return jsonify({
-        "success": True,
-        "message": f"Đã vào phòng {room_code}",
-        "players": [p.name for p in room.players],
-    })
+    return jsonify({"success": True, "message": f"Đã vào phòng {room_code}", "players": [p.name for p in room.players]})
 
 
-# ---------------------------------------------------------------------------
-# API 3: Bắt đầu trò chơi và phân vai
-# ---------------------------------------------------------------------------
+@app.route("/api/leave-room", methods=["POST"])
+def leave_room():
+    """Chỉ cho rời phòng khi còn ở sảnh chờ."""
+    data = request.get_json(silent=True) or {}
+    room_code = (data.get("room_code") or "").strip()
+    name = (data.get("name") or "").strip()
+    room = get_room(room_code)
+    if not room:
+        return error("Phòng không tồn tại!", 404)
+    if room.is_started:
+        return error("Ván đang diễn ra, không thể rời phòng giữa chừng!")
+    player = room.find_player(name)
+    if not player:
+        return error("Bạn không ở trong phòng này!", 404)
+    room.players.remove(player)
+    room.add_log(f"{name} đã rời phòng.")
+    if not room.players:
+        rooms.pop(room_code, None)
+    return jsonify({"success": True, "message": "Đã rời phòng."})
+
+
+@app.route("/api/play-again", methods=["POST"])
+def play_again():
+    """Sau khi ván kết thúc, ai cũng bấm được: giữ nguyên phòng + người chơi, quay về sảnh chờ."""
+    data = request.get_json(silent=True) or {}
+    room = get_room((data.get("room_code") or "").strip())
+    if not room:
+        return error("Phòng không tồn tại!", 404)
+    if room.phase != "ended":
+        return error("Chỉ có thể chơi lại sau khi ván đã kết thúc!")
+    room.reset_for_new_round()
+    return jsonify({"success": True, "message": "Đã quay về phòng chờ cho ván mới!"})
+
+
 @app.route("/api/start-game", methods=["POST"])
 def start_game():
     data = request.get_json(silent=True) or {}
-    room_code = (data.get("room_code") or "").strip()
-
-    room = get_room_or_404(room_code)
+    room = get_room((data.get("room_code") or "").strip())
     if not room:
         return error("Phòng không tồn tại!", 404)
-
     if room.is_started:
         return error("Trò chơi đã được bắt đầu rồi!")
-
     if len(room.players) < MIN_PLAYERS:
         return error(f"Cần ít nhất {MIN_PLAYERS} người chơi để bắt đầu!")
 
@@ -297,12 +805,7 @@ def start_game():
     except ValueError as e:
         return error(str(e))
 
-    game_data = [{"name": p.name, "role": p.role} for p in room.players]
-    return jsonify({
-        "success": True,
-        "message": "Trò chơi đã bắt đầu! Vai trò đã được chia (bí mật với từng người).",
-        "data": game_data,  # host-only view; frontend host page hiển thị, player lấy qua /api/my-role
-    })
+    return jsonify({"success": True, "message": "Trò chơi đã bắt đầu! Mời cả làng bầu Trưởng Làng trước."})
 
 
 # ---------------------------------------------------------------------------
@@ -310,48 +813,16 @@ def start_game():
 # ---------------------------------------------------------------------------
 @app.route("/api/room-state", methods=["GET"])
 def room_state():
-    room_code = (request.args.get("room_code") or "").strip()
-    room = get_room_or_404(room_code)
+    room = get_room((request.args.get("room_code") or "").strip())
     if not room:
         return error("Phòng không tồn tại!", 404)
     return jsonify({"success": True, "room": room.to_state_dict()})
 
 
-@app.route("/api/host-view", methods=["GET"])
-def host_view():
-    """Chỉ dành cho quản trò: xem đầy đủ vai trò của tất cả người chơi."""
-    room_code = (request.args.get("room_code") or "").strip()
-    host_name = (request.args.get("host_name") or "").strip()
-    room = get_room_or_404(room_code)
-    if not room:
-        return error("Phòng không tồn tại!", 404)
-
-    host_player = room.find_player(host_name)
-    if not host_player or not host_player.is_host:
-        return error("Bạn không phải quản trò của phòng này!", 403)
-
-    state = room.to_state_dict()
-    state["players"] = [p.to_full_dict() for p in room.players]
-    state["night_status"] = {
-        "wolf_done": room.wolf_target is not None,
-        "guard_done": room.guard_target is not None,
-        "witch_done": room.witch_save_target is not None or room.witch_kill_target is not None,
-    }
-    has_seer = any(p.role == "Tiên Tri" and p.is_alive for p in room.players)
-    has_guard = any(p.role == "Bảo Vệ" and p.is_alive for p in room.players)
-    has_witch = any(p.role == "Phù Thủy" and p.is_alive for p in room.players)
-    has_wolf = any(p.role == "Ma Sói" and p.is_alive for p in room.players)
-    state["night_roles_alive"] = {
-        "wolf": has_wolf, "guard": has_guard, "witch": has_witch, "seer": has_seer,
-    }
-    return jsonify({"success": True, "room": state})
-
-
 @app.route("/api/my-role", methods=["GET"])
 def my_role():
-    room_code = (request.args.get("room_code") or "").strip()
+    room = get_room((request.args.get("room_code") or "").strip())
     name = (request.args.get("name") or "").strip()
-    room = get_room_or_404(room_code)
     if not room:
         return error("Phòng không tồn tại!", 404)
 
@@ -359,304 +830,385 @@ def my_role():
     if not player:
         return error("Không tìm thấy người chơi trong phòng!", 404)
 
+    state = room.to_state_dict()
+    my_turn = (
+        room.phase == "night"
+        and player.is_alive
+        and room.subphase is not None
+        and player.role == SUBPHASE_ROLE.get(room.subphase)
+    )
+
     payload = {
         "success": True,
-        "is_started": room.is_started,
-        "phase": room.phase,
-        "day_count": room.day_count,
-        "winner": room.winner,
+        "room": state,
         "name": player.name,
         "role": player.role,
         "is_alive": player.is_alive,
         "witch_used_save": player.witch_used_save,
         "witch_used_kill": player.witch_used_kill,
-        "last_result_msg": room.last_night_result["message"] if room.last_night_result else None,
+        "my_turn": my_turn,
         "alive_players": [p.name for p in room.players if p.is_alive and p.name != player.name],
+        "all_alive_players": [p.name for p in room.players if p.is_alive],
+        "has_voted": room.votes.get(player.name) is not None if room.phase == "day" else False,
+        "has_voted_election": room.election_votes.get(player.name) is not None if room.phase == "election" else False,
+        "is_chief": player.name == room.chief_name,
     }
 
-    # Phù Thủy cần biết ai vừa bị Sói cắn để quyết định cứu hay không
     if player.role == "Phù Thủy" and room.phase == "night":
         payload["wolf_victim_hint"] = room.wolf_target
+
+    if player.role == "Ma Sói" and room.phase == "night":
+        alive_wolves = [p for p in room.players if p.role == "Ma Sói" and p.is_alive]
+        payload["wolf_ready_count"] = len(room.wolf_ready)
+        payload["wolf_total_count"] = len(alive_wolves)
+        payload["wolf_current_target"] = room.wolf_target
+        payload["i_am_ready"] = player.name in room.wolf_ready
+
+    payload["hunter_turn"] = (room.phase == "hunter_shoot" and player.name == room.hunter_pending_name)
+
+    channel = room.chat_channel_for(player)
+    payload["chat"] = room.visible_chat(player)
+    payload["chat_channel"] = channel
+    payload["chat_can_send"] = channel is not None
+    payload["chat_hint"] = {
+        "general": "Gửi tới: Chat chung",
+        "wolf": "Gửi tới: Sói chat riêng",
+        "dead": "Gửi tới: Chat của người chết",
+        None: "Đang là ban đêm — hãy giữ im lặng",
+    }[channel]
 
     return jsonify(payload)
 
 
 # ---------------------------------------------------------------------------
-# API 4: Ma Sói chọn mục tiêu vào ban đêm
+# API: Bầu Trưởng Làng
 # ---------------------------------------------------------------------------
+@app.route("/api/election-vote", methods=["POST"])
+def election_vote():
+    data = request.get_json(silent=True) or {}
+    room = get_room((data.get("room_code") or "").strip())
+    if not room:
+        return error("Phòng không tồn tại!", 404)
+    if room.phase != "election":
+        return error("Không phải lúc bầu Trưởng Làng!")
+
+    voter_name = (data.get("voter_name") or "").strip()
+    choice_name = (data.get("choice_name") or "").strip()
+
+    voter = room.find_player(voter_name)
+    if not voter or not voter.is_alive:
+        return error("Bạn không thể bỏ phiếu!", 403)
+    if choice_name:
+        choice = room.find_player(choice_name)
+        if not choice or not choice.is_alive:
+            return error("Người được đề cử không hợp lệ!")
+
+    room.cast_election_vote(voter_name, choice_name)
+    return jsonify({"success": True, "message": "Đã ghi nhận phiếu bầu Trưởng Làng của bạn."})
+
+
+# ---------------------------------------------------------------------------
+# Hành động ban đêm — chỉ chấp nhận đúng lượt
+# ---------------------------------------------------------------------------
+def _check_turn(room, subphase_key, player):
+    if room.phase == "transition":
+        return error("Đang chuyển tiếp, vui lòng đợi giây lát...")
+    if room.phase != "night":
+        return error("Không phải phiên ban đêm!")
+    if room.subphase != subphase_key:
+        return error(f"Chưa tới lượt của {SUBPHASE_ROLE[subphase_key]}, vui lòng chờ!")
+    if not player or not player.is_alive:
+        return error(f"Bạn không phải {SUBPHASE_ROLE[subphase_key]} còn sống!", 403)
+    if player.role != SUBPHASE_ROLE[subphase_key]:
+        return error(f"Bạn không phải {SUBPHASE_ROLE[subphase_key]}!", 403)
+    return None
+
+
 @app.route("/api/wolf-action", methods=["POST"])
 def wolf_action():
     data = request.get_json(silent=True) or {}
-    room_code = (data.get("room_code") or "").strip()
-    target_name = (data.get("target_name") or "").strip()
-    wolf_name = (data.get("wolf_name") or "").strip()
-
-    room = get_room_or_404(room_code)
+    room = get_room((data.get("room_code") or "").strip())
     if not room:
         return error("Phòng không tồn tại!", 404)
-    if room.phase != "night":
-        return error("Không phải phiên ban đêm!")
 
-    if wolf_name:
-        wolf_player = room.find_player(wolf_name)
-        if not wolf_player or not wolf_player.is_alive or wolf_player.role != "Ma Sói":
-            return error("Bạn không phải Ma Sói còn sống, không thể cắn!", 403)
+    wolf_name = (data.get("wolf_name") or "").strip()
+    target_name = (data.get("target_name") or "").strip()
+    wolf_player = room.find_player(wolf_name)
+
+    err = _check_turn(room, "wolf", wolf_player)
+    if err:
+        return err
 
     target = room.find_player(target_name)
     if not target or not target.is_alive:
         return error("Mục tiêu không hợp lệ!")
 
+    # Bàn có nhiều Sói (8+ người): mục tiêu mới nhất được ghi nhận, nhưng
+    # lượt Sói chỉ thật sự kết thúc khi TẤT CẢ Sói còn sống đã xác nhận —
+    # tránh việc một Sói bấm trước làm những Sói khác bị "khoá" mất lượt.
     room.wolf_target = target_name
-    room.add_log("Ma Sói đã chọn xong mục tiêu trong đêm.")
-    return jsonify({"success": True, "message": f"Sói đã chọn tiêu diệt: {target_name}"})
+    room.wolf_ready.add(wolf_name)
+    alive_wolves = [p for p in room.players if p.role == "Ma Sói" and p.is_alive]
+    ready_count = len(room.wolf_ready)
+    total_wolves = len(alive_wolves)
+    room.add_log(f"Một Sói đã chọn xong mục tiêu ({ready_count}/{total_wolves}).")
 
-
-# ---------------------------------------------------------------------------
-# API 5: Tiên Tri soi danh tính
-# ---------------------------------------------------------------------------
-@app.route("/api/seer-action", methods=["POST"])
-def seer_action():
-    data = request.get_json(silent=True) or {}
-    room_code = (data.get("room_code") or "").strip()
-    seer_name = (data.get("seer_name") or "").strip()
-    target_name = (data.get("target_name") or "").strip()
-
-    room = get_room_or_404(room_code)
-    if not room:
-        return error("Phòng không tồn tại!", 404)
-    if room.phase != "night":
-        return error("Không phải phiên ban đêm!")
-
-    seer_player = room.find_player(seer_name)
-    if not seer_player or not seer_player.is_alive:
-        return error("Tiên Tri đã chết hoặc không tồn tại, không thể soi!")
-    if seer_player.role != "Tiên Tri":
-        return error("Bạn không phải Tiên Tri!", 403)
-
-    target = room.find_player(target_name)
-    if not target:
-        return error("Không tìm thấy mục tiêu!")
-
-    role_hint = "Ma Sói" if target.role == "Ma Sói" else "Dân Làng/Phe Khác"
+    if ready_count >= total_wolves:
+        room.advance_subphase()
+        note = "Cả bầy đã thống nhất."
+    else:
+        note = f"Đang chờ {total_wolves - ready_count} Sói còn lại xác nhận..."
 
     return jsonify({
         "success": True,
-        "target": target_name,
-        "role_hint": role_hint,
-        "message": f"Tiên tri đã soi {target_name}",
+        "message": f"Sói đã chọn tiêu diệt: {target_name}. {note}",
+        "wolf_ready_count": ready_count,
+        "wolf_total_count": total_wolves,
     })
 
 
-# ---------------------------------------------------------------------------
-# API 6: Bảo Vệ chọn người che chở
-# ---------------------------------------------------------------------------
 @app.route("/api/guard-action", methods=["POST"])
 def guard_action():
     data = request.get_json(silent=True) or {}
-    room_code = (data.get("room_code") or "").strip()
-    guard_name = (data.get("guard_name") or "").strip()
-    target_name = (data.get("target_name") or "").strip()
-
-    room = get_room_or_404(room_code)
+    room = get_room((data.get("room_code") or "").strip())
     if not room:
         return error("Phòng không tồn tại!", 404)
-    if room.phase != "night":
-        return error("Không phải phiên ban đêm!")
 
+    guard_name = (data.get("guard_name") or "").strip()
+    target_name = (data.get("target_name") or "").strip()
     guard_player = room.find_player(guard_name)
-    if not guard_player or not guard_player.is_alive:
-        return error("Bảo Vệ đã chết hoặc không tồn tại, không thể bảo vệ!")
-    if guard_player.role != "Bảo Vệ":
-        return error("Bạn không phải Bảo Vệ!", 403)
+
+    err = _check_turn(room, "guard", guard_player)
+    if err:
+        return err
 
     target = room.find_player(target_name)
     if not target or not target.is_alive:
         return error("Mục tiêu không hợp lệ!")
 
     room.guard_target = target_name
-    room.add_log("Bảo Vệ đã chọn xong người che chở trong đêm.")
+    room.add_log("Bảo Vệ đã chọn xong người che chở.")
+    room.advance_subphase()
     return jsonify({"success": True, "message": f"Bảo Vệ đã chọn bảo vệ: {target_name}"})
 
 
-# ---------------------------------------------------------------------------
-# API: Phù Thủy dùng thuốc (cứu / giết)
-# ---------------------------------------------------------------------------
+@app.route("/api/seer-action", methods=["POST"])
+def seer_action():
+    data = request.get_json(silent=True) or {}
+    room = get_room((data.get("room_code") or "").strip())
+    if not room:
+        return error("Phòng không tồn tại!", 404)
+
+    seer_name = (data.get("seer_name") or "").strip()
+    target_name = (data.get("target_name") or "").strip()
+    seer_player = room.find_player(seer_name)
+
+    err = _check_turn(room, "seer", seer_player)
+    if err:
+        return err
+
+    target = room.find_player(target_name)
+    if not target:
+        return error("Không tìm thấy mục tiêu!")
+
+    role_hint = "Ma Sói" if target.role == "Ma Sói" else "Dân Làng/Phe Khác"
+    room.add_log("Tiên Tri đã soi xong.")
+    # Không tự chuyển lượt ngay — để Tiên Tri có đủ thời gian đọc kết quả rồi
+    # tự bấm "Tiếp tục" (xem /api/seer-done). Gia hạn thêm thời gian đọc kết
+    # quả, tách biệt với thời gian cân nhắc chọn mục tiêu ban đầu.
+    room.subphase_deadline = time.time() + SEER_RESULT_READ_SECONDS
+    return jsonify({"success": True, "target": target_name, "role_hint": role_hint, "message": f"Tiên tri đã soi {target_name}"})
+
+
+@app.route("/api/seer-pass", methods=["POST"])
+def seer_pass():
+    data = request.get_json(silent=True) or {}
+    room = get_room((data.get("room_code") or "").strip())
+    if not room:
+        return error("Phòng không tồn tại!", 404)
+    seer_player = room.find_player((data.get("seer_name") or "").strip())
+    err = _check_turn(room, "seer", seer_player)
+    if err:
+        return err
+    room.add_log("Tiên Tri không soi ai đêm nay.")
+    room.advance_subphase()
+    return jsonify({"success": True, "message": "Đã bỏ qua lượt soi."})
+
+
+@app.route("/api/seer-done", methods=["POST"])
+def seer_done():
+    """Tiên Tri bấm 'Tiếp tục' sau khi đã đọc xong kết quả soi."""
+    data = request.get_json(silent=True) or {}
+    room = get_room((data.get("room_code") or "").strip())
+    if not room:
+        return error("Phòng không tồn tại!", 404)
+    seer_player = room.find_player((data.get("seer_name") or "").strip())
+    err = _check_turn(room, "seer", seer_player)
+    if err:
+        return err
+    room.advance_subphase()
+    return jsonify({"success": True, "message": "Tiên Tri đã xong lượt."})
+
+
 @app.route("/api/witch-action", methods=["POST"])
 def witch_action():
     data = request.get_json(silent=True) or {}
-    room_code = (data.get("room_code") or "").strip()
+    room = get_room((data.get("room_code") or "").strip())
+    if not room:
+        return error("Phòng không tồn tại!", 404)
+
     witch_name = (data.get("witch_name") or "").strip()
     action_type = (data.get("action_type") or "").strip().lower()
     target_name = (data.get("target_name") or "").strip()
-
-    room = get_room_or_404(room_code)
-    if not room:
-        return error("Phòng không tồn tại!", 404)
-    if room.phase != "night":
-        return error("Không phải phiên ban đêm!")
-
     witch_player = room.find_player(witch_name)
-    if not witch_player or not witch_player.is_alive:
-        return error("Phù Thủy đã chết hoặc không tồn tại, không thể dùng thuốc!")
-    if witch_player.role != "Phù Thủy":
-        return error("Bạn không phải Phù Thủy!", 403)
+
+    err = _check_turn(room, "witch", witch_player)
+    if err:
+        return err
 
     if action_type == "save":
         if witch_player.witch_used_save:
-            return error("Bạn đã dùng bình cứu rồi, không thể dùng thêm!")
+            return error("Bạn đã dùng bình cứu rồi!")
         if not room.wolf_target:
             return error("Đêm nay chưa có ai bị Sói cắn để cứu!")
         room.witch_save_target = room.wolf_target
         witch_player.witch_used_save = True
         room.add_log("Phù Thủy đã dùng bình cứu.")
-        return jsonify({"success": True, "message": f"Phù Thủy đã dùng bình cứu cho: {room.wolf_target}"})
+        return jsonify({"success": True, "message": f"Đã cứu {room.wolf_target}"})
 
     elif action_type == "kill":
         if witch_player.witch_used_kill:
-            return error("Bạn đã dùng bình độc rồi, không thể dùng thêm!")
+            return error("Bạn đã dùng bình độc rồi!")
         target = room.find_player(target_name)
         if not target or not target.is_alive:
             return error("Mục tiêu không hợp lệ!")
         room.witch_kill_target = target_name
         witch_player.witch_used_kill = True
         room.add_log("Phù Thủy đã dùng bình độc.")
-        return jsonify({"success": True, "message": f"Phù Thủy đã dùng bình độc tiêu diệt: {target_name}"})
+        return jsonify({"success": True, "message": f"Đã đầu độc {target_name}"})
 
-    return error("Hành động không hợp lệ! (action_type phải là 'save' hoặc 'kill')")
+    elif action_type == "pass":
+        room.add_log("Phù Thủy không dùng thuốc đêm nay.")
+        room.advance_subphase()
+        return jsonify({"success": True, "message": "Đã bỏ qua lượt."})
+
+    return error("Hành động không hợp lệ! (action_type phải là 'save', 'kill' hoặc 'pass')")
 
 
-# ---------------------------------------------------------------------------
-# API 7: Tổng kết đêm
-# ---------------------------------------------------------------------------
-@app.route("/api/resolve-night", methods=["POST"])
-def resolve_night():
+@app.route("/api/witch-done", methods=["POST"])
+def witch_done():
+    """Phù Thủy bấm 'Xong lượt' sau khi đã dùng 0/1/2 bình thuốc."""
     data = request.get_json(silent=True) or {}
-    room_code = (data.get("room_code") or "").strip()
-
-    room = get_room_or_404(room_code)
+    room = get_room((data.get("room_code") or "").strip())
     if not room:
         return error("Phòng không tồn tại!", 404)
-    if room.phase != "night":
-        return error("Không phải phiên ban đêm, không thể tổng kết!")
-
-    victims = []
-
-    # 1) Xử lý nạn nhân của Sói: được cứu nếu Bảo Vệ hoặc Phù Thủy (bình cứu) trùng mục tiêu
-    wolf_victim = room.wolf_target
-    saved = wolf_victim is not None and (
-        wolf_victim == room.guard_target or wolf_victim == room.witch_save_target
-    )
-    if wolf_victim and not saved:
-        victims.append(wolf_victim)
-
-    # 2) Xử lý mục tiêu bị Phù Thủy đầu độc (độc lập với Sói)
-    if room.witch_kill_target and room.witch_kill_target not in victims:
-        victims.append(room.witch_kill_target)
-
-    # Áp dụng cái chết
-    for name in victims:
-        p = room.find_player(name)
-        if p:
-            p.is_alive = False
-
-    room.reset_night_actions()
-    room.phase = "day"
-
-    if victims:
-        msg = "Trời sáng! Nạn nhân đêm qua là: " + ", ".join(victims)
-    else:
-        msg = "Trời sáng! Đêm qua không có ai chết."
-    room.add_log(msg)
-
-    winner = room.check_win()
-    room.last_night_result = {
-        "day": room.day_count,
-        "victims": victims,
-        "message": msg,
-    }
-
-    alive_players = [p.name for p in room.players if p.is_alive]
-
-    return jsonify({
-        "success": True,
-        "day": room.day_count,
-        "victims_of_night": victims,
-        "message": msg,
-        "alive_players": alive_players,
-        "phase": room.phase,
-        "winner": winner,
-    })
+    witch_player = room.find_player((data.get("witch_name") or "").strip())
+    err = _check_turn(room, "witch", witch_player)
+    if err:
+        return err
+    room.advance_subphase()
+    return jsonify({"success": True, "message": "Phù Thủy đã xong lượt."})
 
 
 # ---------------------------------------------------------------------------
-# API: Bỏ phiếu treo cổ ban ngày
+# API: Chat
 # ---------------------------------------------------------------------------
-@app.route("/api/vote-hang", methods=["POST"])
-def vote_hang():
+@app.route("/api/chat-send", methods=["POST"])
+def chat_send():
     data = request.get_json(silent=True) or {}
-    room_code = (data.get("room_code") or "").strip()
-    suspect_name = (data.get("suspect_name") or "").strip()
+    room = get_room((data.get("room_code") or "").strip())
+    if not room:
+        return error("Phòng không tồn tại!", 404)
+    player = room.find_player((data.get("name") or "").strip())
+    if not player:
+        return error("Không tìm thấy người chơi trong phòng!", 404)
 
-    room = get_room_or_404(room_code)
+    text = " ".join((data.get("text") or "").split())[:CHAT_MAX_LEN]
+    if not text:
+        return error("Tin nhắn trống!")
+
+    now = time.time()
+    if now - room._chat_last.get(player.name, 0) < CHAT_COOLDOWN:
+        return error("Bạn nhắn quá nhanh, chậm lại một chút!", 429)
+
+    msg = room.add_chat(player, text)
+    if msg is None:
+        return error("Hiện chưa thể nhắn tin (ban đêm chỉ Sói được thì thầm với nhau)!", 403)
+    room._chat_last[player.name] = now
+    return jsonify({"success": True, "message": msg})
+
+
+# ---------------------------------------------------------------------------
+# API: Thợ Săn bắn trả
+# ---------------------------------------------------------------------------
+@app.route("/api/hunter-shoot", methods=["POST"])
+def hunter_shoot():
+    data = request.get_json(silent=True) or {}
+    room = get_room((data.get("room_code") or "").strip())
+    if not room:
+        return error("Phòng không tồn tại!", 404)
+    if room.phase != "hunter_shoot":
+        return error("Không phải lượt bắn của Thợ Săn!")
+    if (data.get("hunter_name") or "").strip() != room.hunter_pending_name:
+        return error("Không phải lượt bắn của bạn!", 403)
+    target_name = (data.get("target_name") or "").strip()
+    if target_name:
+        target = room.find_player(target_name)
+        if not target or not target.is_alive:
+            return error("Mục tiêu không hợp lệ!")
+    room.resolve_hunter_shoot(target_name)
+    return jsonify({"success": True, "message": "Đã ghi nhận phát bắn của Thợ Săn."})
+
+
+# ---------------------------------------------------------------------------
+# API: Bỏ phiếu ban ngày — mọi người còn sống đều tự bỏ phiếu
+# ---------------------------------------------------------------------------
+@app.route("/api/day-vote", methods=["POST"])
+def day_vote():
+    data = request.get_json(silent=True) or {}
+    room = get_room((data.get("room_code") or "").strip())
     if not room:
         return error("Phòng không tồn tại!", 404)
     if room.phase != "day":
-        return error("Không phải phiên ban ngày, không thể treo cổ!")
+        return error("Không phải phiên ban ngày!")
 
-    suspect = room.find_player(suspect_name)
-    if not suspect or not suspect.is_alive:
-        return error("Nghi phạm không hợp lệ!")
+    voter_name = (data.get("voter_name") or "").strip()
+    suspect_name = (data.get("suspect_name") or "").strip()
 
-    suspect.is_alive = False
-    room.add_log(f"Làng đã quyết định treo cổ {suspect_name}.")
+    voter = room.find_player(voter_name)
+    if not voter or not voter.is_alive:
+        return error("Bạn không thể bỏ phiếu (đã chết hoặc không hợp lệ)!", 403)
 
-    winner = room.check_win()
-    if not winner:
-        room.phase = "night"
-        room.day_count += 1
+    if suspect_name:
+        suspect = room.find_player(suspect_name)
+        if not suspect or not suspect.is_alive:
+            return error("Nghi phạm không hợp lệ!")
 
-    alive_players = [p.name for p in room.players if p.is_alive]
-
-    return jsonify({
-        "success": True,
-        "message": f"{suspect_name} đã bị treo cổ!",
-        "hanged": suspect_name,
-        "alive_players": alive_players,
-        "phase": room.phase,
-        "day_count": room.day_count,
-        "winner": winner,
-    })
+    room.cast_vote(voter_name, suspect_name)
+    return jsonify({"success": True, "message": "Đã ghi nhận phiếu bầu của bạn."})
 
 
 # ---------------------------------------------------------------------------
-# API: Kiểm tra thắng thua
+# API: Kiểm tra thắng thua (trả kết quả chi tiết từng người khi đã kết thúc)
 # ---------------------------------------------------------------------------
 @app.route("/api/check-win", methods=["POST"])
 def check_win():
     data = request.get_json(silent=True) or {}
-    room_code = (data.get("room_code") or "").strip()
-
-    room = get_room_or_404(room_code)
+    room = get_room((data.get("room_code") or "").strip())
     if not room:
         return error("Phòng không tồn tại!", 404)
 
-    winner = room.check_win()
-
-    result = {
-        "success": True,
-        "winner": winner,
-        "phase": room.phase,
-    }
+    winner = room.winner
+    result = {"success": True, "winner": winner, "phase": room.phase}
 
     if winner:
-        # Gắn nhãn VICTORY / LOSE cho từng người chơi theo yêu cầu thiết kế
         results = []
         for p in room.players:
             if winner == "soi":
                 tag = "VICTORY" if p.role == "Ma Sói" else "LOSE"
             else:
                 tag = "VICTORY" if p.role != "Ma Sói" else "LOSE"
-            results.append({"name": p.name, "role": p.role, "result": tag})
+            results.append({"name": p.name, "role": p.role, "result": tag, "was_chief": p.name == room.chief_name})
         result["results"] = results
         result["message"] = "Phe Ma Sói đã chiến thắng! 🐺" if winner == "soi" else "Phe Dân Làng đã chiến thắng! 🎉"
     else:
@@ -669,7 +1221,4 @@ if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "0") == "1"
-    # host="0.0.0.0" để máy khác (LAN hoặc qua tunnel/hosting) truy cập được,
-    # không chỉ riêng máy đang chạy server.
     app.run(host="0.0.0.0", port=port, debug=debug)
-

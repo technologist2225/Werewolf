@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ma Sói</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/game.css') }}">
+</head>
+<body class="game">
+
+<div class="forest-bg" aria-hidden="true">
+  <div class="moon"></div>
+  <div class="fog"></div>
+  <div class="trees"></div>
+</div>
+
+<main class="game-shell">
+
+  <!-- ===================== CỘT TRÁI: DANH SÁCH NGƯỜI CHƠI ===================== -->
+  <aside class="col-left" aria-label="Danh sách người chơi">
+    <section class="panel-fx" id="roster-panel">
+      <header class="fx-title">
+        <h2>Danh sách người chơi</h2>
+        <span class="sub-en">PLAYER LIST · <span id="room-code-label"></span></span>
+      </header>
+      <div class="roster-grid" id="roster-list"></div>
+    </section>
+  </aside>
+
+  <!-- ===================== CỘT GIỮA ===================== -->
+  <section class="col-center">
+
+    <!-- Nhật ký (các dải thông báo nằm ngang) -->
+    <section class="panel-fx log-panel" id="log-panel">
+      <header class="fx-title">
+        <h2>Kịch bản / Nhật ký</h2>
+        <span class="sub-en">GAME LOG</span>
+      </header>
+      <div class="log-strips" id="log-feed"></div>
+    </section>
+
+    <!-- Hàng thẻ vai trò + nến -->
+    <section class="panel-fx roles-panel" id="role-panel" aria-label="Các vai trò trong ván">
+      <div class="roles-wrap">
+        <span class="candle c1"></span><span class="candle c2"></span>
+        <div class="roles-stage">
+          <div id="role-cards" style="display:contents;"></div>
+        </div>
+        <span class="candle c3"></span><span class="candle c4"></span>
+      </div>
+      <div class="my-role-caption">
+        <span id="role-side"></span><strong id="role-name">???</strong>
+        <span> — </span><span id="role-desc"></span>
+        <div id="status-panel"><span id="alive-status"></span></div>
+      </div>
+    </section>
+
+    <!-- Sân khấu: nơi hiện màn hình theo từng giai đoạn (khung GAME LOG / DIALOGUE) -->
+    <section class="panel-fx stage" id="stage">
+      <header class="fx-title">
+        <h2 id="stage-title">Kịch bản / Nhật ký</h2>
+        <span class="sub-en">GAME LOG / DIALOGUE</span>
+        <span class="head-tag" id="phase-tag"></span>
+      </header>
+      <div class="stage-body">
+
+        <div class="stage-empty" id="stage-empty">Đang chờ diễn biến tiếp theo...</div>
+
+        <!-- ELECTION -->
+        <div class="stage-section" id="election-panel">
+          <h3 class="mt-0">Bầu Trưởng Làng</h3>
+          <p class="muted">Trưởng Làng có lá phiếu tính gấp đôi khi cả làng biểu quyết treo cổ.</p>
+          <div class="countdown-wrap">
+            <div class="countdown-track"><div class="countdown-fill" id="election-countdown-fill" style="width:100%;"></div></div>
+            <div class="countdown-text" id="election-countdown-text"></div>
+          </div>
+          <div class="vote-progress" id="election-progress"></div>
+          <div id="election-area"></div>
+        </div>
+
+        <!-- TRANSITION / REVEAL -->
+        <div class="stage-section center" id="transition-panel">
+          <h3 class="mt-0" id="transition-title"></h3>
+          <p class="muted mb-0" id="transition-msg"></p>
+          <div class="countdown-wrap">
+            <div class="countdown-track"><div class="countdown-fill" id="transition-countdown-fill" style="width:100%;"></div></div>
+            <div class="countdown-text" id="transition-countdown-text"></div>
+          </div>
+        </div>
+
+        <!-- HUNTER SHOOT -->
+        <div class="stage-section" id="hunter-panel">
+          <h3 class="mt-0">Thợ Săn bắn trả</h3>
+          <div class="countdown-wrap">
+            <div class="countdown-track"><div class="countdown-fill" id="hunter-countdown-fill" style="width:100%;"></div></div>
+            <div class="countdown-text" id="hunter-countdown-text"></div>
+          </div>
+          <div id="hunter-area"></div>
+        </div>
+
+        <!-- NIGHT -->
+        <div class="stage-section" id="night-panel">
+          <h3 class="mt-0">Đêm <span id="night-day-num"></span></h3>
+          <div class="night-tracker" id="night-tracker"></div>
+          <div class="countdown-wrap" id="countdown-wrap">
+            <div class="countdown-track"><div class="countdown-fill" id="countdown-fill" style="width:100%;"></div></div>
+            <div class="countdown-text" id="countdown-text"></div>
+          </div>
+
+          <div id="turn-banner"></div>
+
+          <div id="action-panel" style="display:none;">
+            <p id="action-desc" class="muted"></p>
+            <div class="target-list" id="target-list"></div>
+            <div id="witch-actions"></div>
+            <div id="seer-result"></div>
+          </div>
+        </div>
+
+        <!-- DAY -->
+        <div class="stage-section" id="day-panel">
+          <h3 class="mt-0">Ngày <span id="day-day-num"></span></h3>
+          <p id="day-result-msg" class="muted"></p>
+          <div class="countdown-wrap">
+            <div class="countdown-track"><div class="countdown-fill" id="day-countdown-fill" style="width:100%;"></div></div>
+            <div class="countdown-text" id="day-countdown-text"></div>
+          </div>
+          <div class="vote-progress" id="vote-progress"></div>
+          <div id="vote-area"></div>
+        </div>
+
+        <!-- END -->
+        <div class="stage-section center" id="end-panel">
+          <h3 class="mt-0" id="end-title"></h3>
+          <div class="role-name" id="end-tag"></div>
+          <p id="end-role-reveal" class="muted"></p>
+          <table class="result-table">
+            <thead><tr><th>Người chơi</th><th>Vai trò</th><th>Kết quả</th></tr></thead>
+            <tbody id="result-body"></tbody>
+          </table>
+          <button class="btn-primary" id="play-again-btn" style="margin-top:16px;">Chơi lại cùng phòng</button>
+          <button class="btn-ghost" id="back-to-home-btn" style="margin-top:10px; width:100%;">Về trang chủ</button>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- Bảng điều khiển hành động -->
+    <section class="panel-fx action-bar" aria-label="Bảng điều khiển hành động">
+      <h3>Bảng điều khiển hành động</h3>
+      <div class="action-btns">
+        <button class="act-btn vote" id="btn-action-vote" disabled>Bỏ phiếu</button>
+        <button class="act-btn" id="btn-action-skill" disabled>Kích hoạt kỹ năng</button>
+        <button class="act-btn" id="btn-action-chat">Nhắn tin</button>
+      </div>
+    </section>
+  </section>
+
+  <!-- ===================== CỘT PHẢI: ĐỒNG HỒ + CHAT ===================== -->
+  <aside class="col-right">
+
+    <section class="panel-fx timer-panel" aria-live="off">
+      <div class="timer-icon" id="timer-icon"></div>
+      <div class="timer-main">
+        <div class="timer-line"><span id="timer-label">Ban đêm:</span><span class="timer-digits" id="timer-digits">--:--</span></div>
+        <div class="timer-sub">TIMER</div>
+      </div>
+      <div class="timer-bar"><div id="timer-fill"></div></div>
+    </section>
+
+    <section class="panel-fx chat-panel">
+      <header class="fx-title">
+        <h2>Khung chat</h2>
+        <span class="sub-en">GAME CHAT</span>
+      </header>
+      <div class="chat-feed" id="chat-feed"></div>
+      <div class="chat-hint" id="chat-hint"></div>
+      <div class="chat-input">
+        <input type="text" id="chat-input" placeholder="Tin nhắn hiện hành..." maxlength="200" autocomplete="off">
+        <button class="btn-send" id="chat-send" disabled>Send</button>
+      </div>
+    </section>
+  </aside>
+
+</main>
+
+<script src="{{ url_for('static', filename='js/common.js') }}"></script>
+<script src="{{ url_for('static', filename='js/game.js') }}"></script>
+</body>
+</html>
